@@ -19,7 +19,15 @@ if (-not $Out) {
 }
 New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Out) | Out-Null
 
-$argv = @('--prompt', $Prompt, '--dit', $dit, '--seconds', "$Seconds", '--out', $Out)
+# --decoder is required non-interactively: without it the CLI opens an arrow
+# picker and dies with EOFError in a script.
+$argv = @(
+    '--prompt', $Prompt,
+    '--dit', $dit,
+    '--decoder', 'same-s',
+    '--seconds', "$Seconds",
+    '--out', $Out
+)
 if ($Seed -gt 0) { $argv += @('--seed', "$Seed") }
 
 Write-Output ("{0} | {1}s | {2}" -f $dit, $Seconds, $Prompt)

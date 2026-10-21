@@ -54,6 +54,13 @@ scripts\ab.ps1
 Generates one 60 s bed and five effects, writes `out/ab.csv` (prompt, seconds, wall time,
 size). Compare against a bed from `songgeneration-mcp` and against real recorded effects.
 
+## Status (2026-10-21)
+
+Installed and benchmarked on this machine: 60 s bed in 19.3 s, 2.0 GB peak, effects
+5.2-5.9 s each (mostly model load), no API key. See `docs/DECISION.md` for the measured
+table, the quiet-effect finding, and the recommendation (a warm local service, not a
+per-call shell-out).
+
 ## Definition of done
 
 - 60 s bed on CPU in under 30 s wall, under 2.5 GB peak RAM.
