@@ -77,14 +77,23 @@ service\start.ps1                    # http://127.0.0.1:11250
 Measured through the service: cold effect **6.56 s** generation (peak normalised to exactly
 -3.0 dB, +4.8 dB gain applied), repeat request **0.022 s** from cache.
 
-Two honest limits:
+**Drop-in for demo-vid-mcp.** The service serves both contracts the pipeline already uses:
 
-1. **Not warm.** The upstream runtime is a one-shot CLI with everything inside `main()`, so
-   the model cannot stay resident. The cache is what makes repeated builds cheap.
-2. **REST, not MCP.** `demo-vid-mcp` talks to `songgeneration-mcp` and `sfx-mcp` over MCP,
-   so this service cannot be dropped into `MUSIC_MCP_URL` / `SFX_MCP_URL` yet. Wiring needs
-   either an MCP facade here or a REST mode in demo-vid. Do not point those variables at
-   11250 expecting it to work.
+| Contract | Where | Verified |
+|---|---|---|
+| `sfx_search` (MCP tool, search + download) | `http://127.0.0.1:11250/mcp` | `resolve_sfx_clip()` returned a real WAV, 8.5 s first / 1.2 s cached |
+| `POST /api/generate` `{prompt, duration}` -> `{success, file}` | `http://127.0.0.1:11250` | `generate_background_music()` returned a 30 s bed, 14.6 s first / 0.4 s cached |
+
+No demo-vid code changes; switch by URL:
+
+```
+SFX_MCP_URL=http://127.0.0.1:11250/mcp
+SONGGENERATION_MCP_URL=http://127.0.0.1:11250
+```
+
+One honest limit: **not warm.** The upstream runtime is a one-shot CLI with everything
+inside `main()`, so the model cannot stay resident. The cache is what makes repeated builds
+cheap, and only the cache is why the second call is under a second.
 
 ## Definition of done
 

@@ -33,6 +33,7 @@ import time
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
+from fastmcp import FastMCP
 from pydantic import BaseModel, Field
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -45,7 +46,16 @@ MODEL_FOR = {"music": "sm-music", "sfx": "sm-sfx"}
 MAX_SECONDS = {"music": 120, "sfx": 30}
 PORT = int(os.getenv("SA3_SERVICE_PORT", "11250"))
 
-app = FastAPI(title="stable-audio-spike", version="0.1.0")
+# The MCP app must exist before FastAPI so its lifespan can be passed in at
+# construction (see mcd BUG-083): without it every HTTP MCP call fails with 500.
+mcp = FastMCP(
+    "stable-audio",
+    instructions="Local music and sound-effect generation (Stable Audio 3, CPU). "
+    "No API key, no network. Results are cached and peak-normalised to -3 dB.",
+)
+mcp_app = mcp.http_app(path="/")
+
+app = FastAPI(title="stable-audio-spike", version="0.2.0", lifespan=mcp_app.lifespan)
 
 
 def _ffmpeg() -> str | None:
@@ -63,6 +73,125 @@ class Request(BaseModel):
     prompt: str = Field(min_length=3, max_length=1200)
     seconds: int = Field(default=60, ge=1)
     seed: int = Field(default=0, ge=0)
+
+
+class GenerateBody(BaseModel):
+    """songgeneration-mcp's request shape: {prompt, duration}."""
+
+    prompt: str = Field(min_length=3, max_length=1200)
+    duration: float = Field(default=30, ge=1)
+
+
+_SFX_INDEX = CACHE / "sfx-index.json"
+
+
+def _load_index() -> dict:
+    try:
+        return json.loads(_SFX_INDEX.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _save_index(index: dict) -> None:
+    CACHE.mkdir(parents=True, exist_ok=True)
+    _SFX_INDEX.write_text(json.dumps(index, indent=1), encoding="utf-8")
+
+
+@mcp.tool
+def sfx_search(
+    operation: str = "search",
+    query: str = "",
+    sound_id: str = "",
+    destination: str = "",
+    duration_max: int = 5,
+) -> dict:
+    """Search or download a sound effect, mirroring sfx-mcp's contract.
+
+    demo-vid-mcp calls sfx_search in two steps: operation="search" returns
+    data.sounds[] with an id, then operation="download" writes a file into
+    `destination` and returns data.file_path. The sounds are generated locally
+    by Stable Audio 3, not recordings from FreeSound, so there is no API key and
+    no per-sound licence to attribute.
+
+    Args:
+        operation: "search" or "download".
+        query: Sound description, e.g. "camera shutter click, close, dry".
+        sound_id: Id returned by search, required for download.
+        destination: Directory to write the WAV into (download).
+        duration_max: Upper bound in seconds for the generated effect.
+
+    Returns:
+        {"success": bool, "data": {...}} or {"success": False, "error": str}.
+    """
+    if operation == "search":
+        text = (query or "").strip()
+        if not text:
+            return {"success": False, "error": "query is required"}
+        seconds = min(max(1, int(duration_max)), MAX_SECONDS["sfx"])
+        key = hashlib.sha256(f"{text}|{seconds}".encode()).hexdigest()[:10]
+        index = _load_index()
+        index[key] = {"prompt": text, "seconds": seconds}
+        _save_index(index)
+        return {
+            "success": True,
+            "data": {
+                "query": text,
+                "count": 1,
+                "sounds": [
+                    {
+                        "id": key,
+                        "name": text,
+                        "duration": seconds,
+                        "license": "generated locally (Stable Audio 3 Community License)",
+                        "source": "stable-audio-3 sm-sfx",
+                    }
+                ],
+            },
+        }
+
+    if operation != "download":
+        return {"success": False, "error": f"unknown operation '{operation}'"}
+
+    entry = _load_index().get(sound_id)
+    if not entry:
+        return {"success": False, "error": f"unknown sound_id '{sound_id}'"}
+    if not destination:
+        return {"success": False, "error": "destination is required"}
+    try:
+        result = generate("sfx", entry["prompt"], int(entry["seconds"]), 0)
+    except HTTPException as exc:
+        return {"success": False, "error": str(exc.detail)}
+    dest_dir = Path(destination)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / f"sfx-{sound_id}.wav"
+    shutil.copy2(result["audio_path"], dest)
+    return {
+        "success": True,
+        "data": {
+            "file_path": str(dest),
+            "bytes": dest.stat().st_size,
+            "cached": result.get("cached", False),
+        },
+    }
+
+
+@app.post("/api/generate")
+def generate_compat(body: GenerateBody) -> dict:
+    """songgeneration-mcp's endpoint, served locally.
+
+    demo-vid-mcp POSTs {"prompt", "duration"} and expects {"success", "file"}.
+    """
+    try:
+        result = generate("music", body.prompt, int(round(body.duration)), 0)
+    except HTTPException as exc:
+        return {"success": False, "error": str(exc.detail)}
+    return {
+        "success": True,
+        "file": result["audio_path"],
+        "backend": "stable-audio-3 sm-music (local, CPU)",
+        "cached": result.get("cached", False),
+        "wall_s": result.get("wall_s"),
+    }
 
 
 def _ready() -> tuple[bool, str]:
@@ -208,6 +337,7 @@ def health() -> dict:
         "cache_entries": cached,
         "target_peak_db": TARGET_PEAK_DB,
         "port": PORT,
+        "mcp_endpoint": f"http://127.0.0.1:{PORT}/mcp",
     }
 
 
@@ -227,6 +357,8 @@ def cache() -> dict:
         return {"entries": 0, "items": []}
     items = []
     for meta in sorted(CACHE.glob("*.json")):
+        if meta.name == _SFX_INDEX.name:
+            continue
         try:
             data = json.loads(meta.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -234,3 +366,25 @@ def cache() -> dict:
         data["audio"] = str(meta.with_suffix(".wav"))
         items.append(data)
     return {"entries": len(items), "items": items[-50:]}
+
+
+class _McpPathAlias:
+    """Route /mcp to the mounted MCP app (Starlette needs the trailing slash).
+
+    Without this, POST /mcp hits the mount with an empty child path and returns
+    405, while /mcp/ works - the exact failure in mcd BUG-083.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") == "http" and scope.get("path") == "/mcp":
+            scope = dict(scope)
+            scope["path"] = "/mcp/"
+            scope["raw_path"] = b"/mcp/"
+        await self.app(scope, receive, send)
+
+
+app.add_middleware(_McpPathAlias)
+app.mount("/mcp", mcp_app)
