@@ -95,6 +95,15 @@ One honest limit: **not warm.** The upstream runtime is a one-shot CLI with ever
 inside `main()`, so the model cannot stay resident. The cache is what makes repeated builds
 cheap, and only the cache is why the second call is under a second.
 
+
+### Long beds
+
+`sm-music` stops at 120 s, so a 280 s video cannot be one call. The service builds longer
+beds from 110 s windows, each with a distinct seed, joined with a 3 s crossfade and trimmed
+to the requested length. Measured: a 283 s bed took **107-114 s** uncached (three windows),
+then the demo re-record reused it from cache as one continuous track. Each window is
+independently prompted, so the bed is continuous rather than one musical arc; crossfade
+masks the join, not a change in mood.
 ## Definition of done
 
 - 60 s bed on CPU in under 30 s wall, under 2.5 GB peak RAM.
