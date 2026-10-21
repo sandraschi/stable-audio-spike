@@ -56,10 +56,35 @@ size). Compare against a bed from `songgeneration-mcp` and against real recorded
 
 ## Status (2026-10-21)
 
-Installed and benchmarked on this machine: 60 s bed in 19.3 s, 2.0 GB peak, effects
-5.2-5.9 s each (mostly model load), no API key. See `docs/DECISION.md` for the measured
-table, the quiet-effect finding, and the recommendation (a warm local service, not a
-per-call shell-out).
+Installed, benchmarked and wrapped in a local service: 60 s bed in 19.3 s, 2.0 GB peak,
+uncached effects 5-7 s (mostly model load), cached in 0.02 s, no API key. See
+`docs/DECISION.md` for the measured table and the quiet-effect finding.
+
+
+## Local service (built 2026-10-21, port 11250)
+
+```powershell
+service\bootstrap-service.ps1        # one-time venv
+service\start.ps1                    # http://127.0.0.1:11250
+```
+
+| Endpoint | Body | Returns |
+|---|---|---|
+| `GET /api/health` | - | readiness, cache size, `warm: false`, the reason |
+| `POST /api/music` | `{"prompt": "...", "seconds": 60, "seed": 0}` | `{success, audio_path, cached, wall_s, gain_db}` |
+| `POST /api/sfx` | `{"prompt": "...", "seconds": 2}` | same |
+
+Measured through the service: cold effect **6.56 s** generation (peak normalised to exactly
+-3.0 dB, +4.8 dB gain applied), repeat request **0.022 s** from cache.
+
+Two honest limits:
+
+1. **Not warm.** The upstream runtime is a one-shot CLI with everything inside `main()`, so
+   the model cannot stay resident. The cache is what makes repeated builds cheap.
+2. **REST, not MCP.** `demo-vid-mcp` talks to `songgeneration-mcp` and `sfx-mcp` over MCP,
+   so this service cannot be dropped into `MUSIC_MCP_URL` / `SFX_MCP_URL` yet. Wiring needs
+   either an MCP facade here or a REST mode in demo-vid. Do not point those variables at
+   11250 expecting it to work.
 
 ## Definition of done
 
@@ -77,3 +102,5 @@ per-call shell-out).
 | `scripts/ab.ps1` | the benchmark run |
 | `docs/DECISION.md` | go/no-go criteria and the result |
 | `upstream/` | read-only clone, gitignored |
+| `service/` | FastAPI audio service (REST, port 11250) |
+| `D:\Dev\models\stable-audio-3` | vendored weights, 2.65 GB, outside git |
