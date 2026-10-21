@@ -1,0 +1,6 @@
+upstream/
+out/
+.venv/
+*.wav
+*.log
+__pycache__/
