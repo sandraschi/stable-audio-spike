@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -44,6 +45,12 @@ CACHE = ROOT / "out" / "cache"
 TARGET_PEAK_DB = -3.0
 MODEL_FOR = {"music": "sm-music", "sfx": "sm-sfx"}
 MAX_SECONDS = {"music": 120, "sfx": 30}
+# sm-music caps at 120 s per call. Longer beds are built from 110 s windows
+# joined with a crossfade, then trimmed; the model has no continuation mode
+# exposed through the TFLite CLI, so this is a continuous bed, not one arc.
+MUSIC_WINDOW_S = 110
+CROSSFADE_S = 3
+MAX_TOTAL_S = 900
 PORT = int(os.getenv("SA3_SERVICE_PORT", "11250"))
 
 # The MCP app must exist before FastAPI so its lifespan can be passed in at
@@ -247,7 +254,104 @@ def _cache_key(model: str, prompt: str, seconds: int, seed: int) -> str:
     return hashlib.sha256(body.encode("utf-8")).hexdigest()[:20]
 
 
+def _generate_long_music(prompt: str, seconds: int, seed: int) -> dict:
+    """Beds longer than one model window: N windows, acrossfade, trim, normalise."""
+    seconds = min(max(1, seconds), MAX_TOTAL_S)
+    ffmpeg = _ffmpeg()
+    if not ffmpeg:
+        raise HTTPException(status_code=503, detail="ffmpeg not found")
+    CACHE.mkdir(parents=True, exist_ok=True)
+    key = _cache_key("sm-music-long", prompt, seconds, seed)
+    out = CACHE / f"{key}.wav"
+    meta = CACHE / f"{key}.json"
+    if out.is_file():
+        return {
+            "success": True,
+            "audio_path": str(out),
+            "cached": True,
+            "model": "sm-music",
+            "seconds": seconds,
+            "engine": "stable-audio-3 sm-music (windows)",
+        }
+
+    windows = max(2, math.ceil(seconds / MUSIC_WINDOW_S))
+    started = time.perf_counter()
+    parts: list[str] = []
+    seeds: list[int] = []
+    for index in range(windows):
+        # Always give each window a distinct seed. With seed=0 the CLI picks a
+        # random seed per run, but the cache key is built from the seed we pass,
+        # so three identical keys returned the same cached window three times.
+        window_seed = (seed if seed else 1) + index * 7919
+        seeds.append(window_seed)
+        part = generate("music", prompt, MUSIC_WINDOW_S, window_seed)
+        parts.append(part["audio_path"])
+
+    argv: list[str] = []
+    for part in parts:
+        argv += ["-i", part]
+    chain = ""
+    prev = "[0]"
+    for index in range(1, len(parts)):
+        chain += f"{prev}[{index}]acrossfade=d={CROSSFADE_S}:c1=tri:c2=tri[a{index}];"
+        prev = f"[a{index}]"
+    joined = CACHE / f"{key}.join.wav"
+    proc = subprocess.run(  # noqa: S603 - fixed argv, absolute binary, no shell
+        [
+            ffmpeg,
+            "-y",
+            "-loglevel",
+            "error",
+            *argv,
+            "-filter_complex",
+            chain.rstrip(";"),
+            "-map",
+            prev,
+            "-t",
+            str(seconds),
+            str(joined),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    if proc.returncode != 0 or not joined.is_file():
+        raise HTTPException(
+            status_code=502, detail=f"join failed: {(proc.stderr or '')[-600:]}"
+        )
+
+    gain = _normalise(joined, out, ffmpeg)
+    joined.unlink(missing_ok=True)
+    wall = round(time.perf_counter() - started, 2)
+    payload = {
+        "prompt": prompt,
+        "model": "sm-music",
+        "seconds": seconds,
+        "seed": seed,
+        "windows": windows,
+        "window_seeds": seeds,
+        "wall_s": wall,
+        "gain_db": gain,
+        "target_peak_db": TARGET_PEAK_DB,
+        "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    meta.write_text(json.dumps(payload, indent=1), encoding="utf-8")
+    return {
+        "success": True,
+        "audio_path": str(out),
+        "cached": False,
+        "model": "sm-music",
+        "seconds": seconds,
+        "wall_s": wall,
+        "windows": windows,
+        "gain_db": gain,
+        "engine": "stable-audio-3 sm-music (windows)",
+    }
+
+
 def generate(kind: str, prompt: str, seconds: int, seed: int) -> dict:
+    if kind == "music" and seconds > MAX_SECONDS["music"]:
+        return _generate_long_music(prompt, seconds, seed)
     ready, reason = _ready()
     if not ready:
         raise HTTPException(status_code=503, detail=reason)
